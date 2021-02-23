@@ -14,7 +14,7 @@ import zio.blocking.Blocking
 import zio.clock.Clock
 import zio.duration._
 import zio.kafka.consumer.Consumer.{AutoOffsetStrategy, OffsetRetrieval}
-import zio.kafka.consumer.{CommittableRecord, Consumer, ConsumerSettings, Offset, Subscription}
+import zio.kafka.consumer._
 import zio.kafka.producer.{Producer, ProducerSettings}
 import zio.stream.ZStream
 
@@ -60,15 +60,19 @@ object Kafka {
 
         def mkRegistry(src: SchemaRegistryClient, topic: String) = (ZLayer.succeed(src) >>> Registry.live) ++ (ZLayer.succeed(topic) >>> Topic.live)
 
-        def mkRecordChunk(kvs: List[(K, V)]) = Chunk.fromIterable(kvs.map { case (k, v) => new ProducerRecord(cfg.sink.topic, k, v) })
         def sink(q: Queue[(K, V)], p: Producer.Service[Registry with Topic, K, V], layer: ULayer[Registry with Topic]) =
           logTask.flatMap { log =>
-            q.takeAll.flatMap {
-              case Nil => log.trace("no data to push").unit
-              case kvs =>
-                p.produceChunkAsync(mkRecordChunk(kvs)).provideSomeLayer[Blocking](layer).retry(tenTimes).flatten.unit <*
-                  log.info(s"pushed ${kvs.size} messages to ${cfg.sink.topic}")
-            }
+            ZStream
+              .fromQueue(q)
+              .map { case (k, v) => new ProducerRecord(cfg.sink.topic, k, v) }
+              .groupedWithin(cfg.bufferSize, 1.second)
+              .tap(recordChunk =>
+                p.produceChunkAsync(recordChunk)
+                  .provideSomeLayer[Blocking](layer)
+                  .retry(tenTimes)
+                  .flatten <* log.info(s"pushed ${recordChunk.size} messages to ${cfg.sink.topic}")
+              )
+              .runDrain
           }
         def mkRecord(k: StateKey, v: State)      = new ProducerRecord(cfg.state.topic, k, v)
         def waitAssignment(sc: Consumer.Service) = sc.assignment.withFilter(_.nonEmpty).retry(tenTimes)
